@@ -38,28 +38,29 @@ chmod +x cleaner.py
 ### Секция [database]
 ```ini
 [database]
-host = localhost
-user = your_username
-password = your_password
-database_name = your_database
-mode = drop_all  ; drop_all, drop_list, truncate
-tables = table1, table2, logs
+host = "localhost"
+user = "your_username"
+password = "your_password"
+database_name = "your_database"
+mode = "drop_all"  ; drop_all, drop_list, truncate
+tables = "table1", "table2", "logs"
+auth_plugin = "mysql_native_password"  ; опционально: для старых версий MySQL
 ```
 
 ### Секция [folders]
 ```ini
 [folders]
-clean = /tmp/cache, /var/log/app
-copy_sources = /path/to/source1, /path/to/source2
-copy_destinations = /tmp/cache, /var/log/app
-copy_user = www-data  ; опционально: пользователь для копирования
+clean = "/tmp/cache", "/var/log/app"
+copy_sources = "/path/to/source1", "/path/to/source2"
+copy_destinations = "/tmp/cache", "/var/log/app"
+copy_user = "www-data"  ; опционально: пользователь для копирования
 ```
 
 ### Секция [backup]
 ```ini
 [backup]
 enable = true  ; включить/отключить резервное копирование
-backup_dir = /tmp/backup  ; папка для бэкапов (пусто = автоматическая)
+backup_dir = "/tmp/backup"  ; папка для бэкапов (пусто = автоматическая)
 ```
 
 ### Секция [security]
