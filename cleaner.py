@@ -6,8 +6,40 @@ import shutil
 import configparser
 import subprocess
 import getpass
+import sys
+import re
 from datetime import datetime
 from shutil import rmtree, copytree, copy2
+
+
+def unquote_value(value):
+    """Удаляет кавычки из значения, если они есть"""
+    if value is None:
+        return value
+    value_str = str(value).strip()
+    if (value_str.startswith('"') and value_str.endswith('"')) or \
+            (value_str.startswith("'") and value_str.endswith("'")):
+        return value_str[1:-1]
+    return value_str
+
+
+def parse_quoted_list(value):
+    """Парсит список значений, которые могут быть в кавычках"""
+    if not value:
+        return []
+
+    # Регулярное выражение для поиска значений в кавычках или без
+    pattern = r'\"[^\"]+\"|\'[^\']+\'|[^,\s]+'
+    matches = re.findall(pattern, value)
+
+    result = []
+    for match in matches:
+        # Удаляем кавычки если они есть
+        cleaned_value = unquote_value(match)
+        if cleaned_value:
+            result.append(cleaned_value)
+
+    return result
 
 
 def load_settings():
@@ -22,22 +54,23 @@ def load_settings():
 
     settings = {
         'database': {
-            'host': config.get('database', 'host', fallback='localhost'),
-            'user': config.get('database', 'user', fallback='root'),
-            'password': config.get('database', 'password', fallback=''),
-            'database_name': config.get('database', 'database_name', fallback=''),
-            'mode': config.get('database', 'mode', fallback='truncate'),
-            'tables': parse_list(config.get('database', 'tables', fallback=''))
+            'host': unquote_value(config.get('database', 'host', fallback='localhost')),
+            'user': unquote_value(config.get('database', 'user', fallback='root')),
+            'password': unquote_value(config.get('database', 'password', fallback='')),
+            'database_name': unquote_value(config.get('database', 'database_name', fallback='')),
+            'mode': unquote_value(config.get('database', 'mode', fallback='truncate')),
+            'tables': parse_quoted_list(config.get('database', 'tables', fallback='')),
+            'auth_plugin': unquote_value(config.get('database', 'auth_plugin', fallback=None))
         },
         'folders': {
-            'clean': parse_list(config.get('folders', 'clean', fallback='')),
-            'copy_sources': parse_list(config.get('folders', 'copy_sources', fallback='')),
-            'copy_destinations': parse_list(config.get('folders', 'copy_destinations', fallback='')),
-            'copy_user': config.get('folders', 'copy_user', fallback='')
+            'clean': parse_quoted_list(config.get('folders', 'clean', fallback='')),
+            'copy_sources': parse_quoted_list(config.get('folders', 'copy_sources', fallback='')),
+            'copy_destinations': parse_quoted_list(config.get('folders', 'copy_destinations', fallback='')),
+            'copy_user': unquote_value(config.get('folders', 'copy_user', fallback=''))
         },
         'backup': {
             'enable': config.getboolean('backup', 'enable', fallback=True),
-            'backup_dir': config.get('backup', 'backup_dir', fallback='')
+            'backup_dir': unquote_value(config.get('backup', 'backup_dir', fallback=''))
         },
         'security': {
             'confirm_destructive_operations': config.getboolean('security', 'confirm_destructive_operations',
@@ -46,13 +79,6 @@ def load_settings():
     }
 
     return settings
-
-
-def parse_list(value):
-    """Преобразует строку с разделителями в список"""
-    if not value:
-        return []
-    return [item.strip() for item in value.split(',') if item.strip()]
 
 
 def confirm_destructive_operation(operation_description):
@@ -73,6 +99,42 @@ def run_as_user(command, username):
         return True, result.stdout
     except subprocess.CalledProcessError as e:
         return False, f"Ошибка: {e.stderr}"
+
+
+def create_db_connection(db_settings):
+    """Создание подключения к базе данных с обработкой ошибок"""
+    try:
+        connection_params = {
+            'host': db_settings['host'],
+            'user': db_settings['user'],
+            'password': db_settings['password'],
+            'database': db_settings['database_name'],
+            'charset': 'utf8mb4'
+        }
+
+        # Добавляем auth_plugin если указан
+        if db_settings['auth_plugin']:
+            connection_params['auth_plugin'] = db_settings['auth_plugin']
+
+        connection = pymysql.connect(**connection_params)
+        return connection, None
+
+    except pymysql.err.OperationalError as e:
+        if "cryptography" in str(e):
+            error_msg = (
+                f"Ошибка подключения к БД: {e}\n"
+                "РЕШЕНИЕ: Установите пакет cryptography:\n"
+                "pip3 install cryptography\n\n"
+                "ИЛИ измените метод аутентификации пользователя MySQL:\n"
+                "ALTER USER 'username'@'localhost' IDENTIFIED WITH mysql_native_password BY 'password';\n"
+                "FLUSH PRIVILEGES;"
+            )
+        else:
+            error_msg = f"Ошибка подключения к БД: {e}"
+
+        return None, error_msg
+    except Exception as e:
+        return None, f"Ошибка подключения к БД: {e}"
 
 
 def get_all_tables(connection):
@@ -111,7 +173,10 @@ def drop_all_tables(connection):
     except Exception as e:
         print(f"Ошибка при удалении таблиц: {str(e)}")
         # Все равно включаем проверку внешних ключей при ошибке
-        cursor.execute("SET FOREIGN_KEY_CHECKS = 1;")
+        try:
+            cursor.execute("SET FOREIGN_KEY_CHECKS = 1;")
+        except:
+            pass
 
 
 def drop_specific_tables(connection, tables_list):
@@ -129,7 +194,10 @@ def drop_specific_tables(connection, tables_list):
 
     except Exception as e:
         print(f"Ошибка при удалении таблиц: {str(e)}")
-        cursor.execute("SET FOREIGN_KEY_CHECKS = 1;")
+        try:
+            cursor.execute("SET FOREIGN_KEY_CHECKS = 1;")
+        except:
+            pass
 
 
 def truncate_tables(connection, tables_list):
@@ -151,15 +219,12 @@ def clean_database(settings):
     """Основная функция для работы с базой данных"""
     db_settings = settings['database']
 
-    try:
-        connection = pymysql.connect(
-            host=db_settings['host'],
-            user=db_settings['user'],
-            password=db_settings['password'],
-            database=db_settings['database_name'],
-            charset='utf8mb4'
-        )
+    connection, error = create_db_connection(db_settings)
+    if error:
+        print(error)
+        return
 
+    try:
         mode = db_settings['mode']
         tables_list = db_settings['tables']
 
@@ -189,9 +254,9 @@ def clean_database(settings):
             print(f"Неизвестный режим работы с БД: {mode}")
 
     except Exception as e:
-        print(f"Ошибка подключения к БД: {str(e)}")
+        print(f"Ошибка при работе с БД: {str(e)}")
     finally:
-        if 'connection' in locals() and connection:
+        if connection:
             connection.close()
 
 
@@ -302,24 +367,24 @@ def show_database_info(settings):
     """Показать информацию о текущем состоянии базы данных"""
     db_settings = settings['database']
 
-    try:
-        connection = pymysql.connect(
-            host=db_settings['host'],
-            user=db_settings['user'],
-            password=db_settings['password'],
-            database=db_settings['database_name'],
-            charset='utf8mb4'
-        )
+    connection, error = create_db_connection(db_settings)
+    if error:
+        print(error)
+        return
 
+    try:
         tables = get_all_tables(connection)
         print(f"Текущее количество таблиц в базе '{db_settings['database_name']}': {len(tables)}")
         if tables:
             print("Список таблиц:", ", ".join(tables))
-
-        connection.close()
+        else:
+            print("В базе данных нет таблиц")
 
     except Exception as e:
-        print(f"Не удалось получить информацию о БД: {str(e)}")
+        print(f"Ошибка при получении информации о БД: {str(e)}")
+    finally:
+        if connection:
+            connection.close()
 
 
 def create_backup(settings, source_folders):
@@ -383,8 +448,25 @@ def print_settings_summary(settings):
     print("=" * 30)
 
 
+def check_dependencies():
+    """Проверка необходимых зависимостей"""
+    try:
+        import pymysql
+        import cryptography
+        return True, None
+    except ImportError as e:
+        missing_package = str(e).split(" ")[-1]
+        return False, f"Не установлен пакет: {missing_package}\nУстановите: pip3 install {missing_package}"
+
+
 if __name__ == "__main__":
     try:
+        # Проверяем зависимости
+        deps_ok, deps_error = check_dependencies()
+        if not deps_ok:
+            print(f"Ошибка зависимостей: {deps_error}")
+            sys.exit(1)
+
         # Загружаем настройки
         settings = load_settings()
 

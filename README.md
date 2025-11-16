@@ -17,7 +17,7 @@
 
 1. **Установите зависимости:**
 ```bash
-pip3 install pymysql
+pip3 install pymysql cryptography
 ```
 
 2. **Создайте файл настроек `settings.ini`:**
