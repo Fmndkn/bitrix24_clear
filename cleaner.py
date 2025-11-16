@@ -44,7 +44,7 @@ def parse_quoted_list(value):
 
 def load_settings():
     """Загрузка настроек из settings.ini"""
-    config = configparser.ConfigParser()
+    config = configparser.ConfigParser(interpolation=None)
 
     # Читаем файл настроек
     if not os.path.exists('settings.ini'):
