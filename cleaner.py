@@ -42,41 +42,140 @@ def parse_quoted_list(value):
     return result
 
 
+def parse_bitrix_settings(php_file_path):
+    """Парсит bitrix/.settings.php и извлекает данные подключения к БД"""
+    if not os.path.exists(php_file_path):
+        return None
+
+    try:
+        with open(php_file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        # Ищем блок connections
+        conn_match = re.search(r"'connections'\s*=>\s*array\s*$(.*?)$$;", content, re.DOTALL | re.MULTILINE)
+        if not conn_match:
+            return None
+
+        conn_block = conn_match.group(1)
+
+        # Извлекаем значения по ключам внутри массива default
+        def extract_value(key):
+            # Учитываем возможные экранирования и пробелы
+            pattern = rf"'{key}'\s*=>\s*'([^']*)'"
+            match = re.search(pattern, conn_block)
+            return match.group(1) if match else None
+
+        db_config = {
+            'host': extract_value('host'),
+            'database': extract_value('database'),
+            'user': extract_value('login'),  # В .settings.php используется login
+            'password': extract_value('password')
+        }
+
+        # Проверка на пустые значения
+        if all(db_config.values()):
+            return db_config
+        return None
+
+    except Exception as e:
+        print(f"Ошибка при чтении {php_file_path}: {str(e)}")
+        return None
+
+
 def load_settings():
-    """Загрузка настроек из settings.ini"""
+    """Загрузка настроек из settings.ini или bitrix/.settings.php"""
+
+    # Приоритет 1: Пробуем взять настройки из родного файла Bitrix
+    bx_db_config = parse_bitrix_settings(os.path.join('bitrix', '.settings.php'))
+
     config = configparser.ConfigParser(interpolation=None)
+    use_ini_fallback = False
 
-    # Читаем файл настроек
-    if not os.path.exists('settings.ini'):
-        raise FileNotFoundError("Файл настроек settings.ini не найден")
-
-    config.read('settings.ini', encoding='utf-8')
+    if not bx_db_config:
+        # Если битрикс-файл не найден или поврежден, пробуем INI
+        if not os.path.exists('settings.ini'):
+            raise FileNotFoundError("Файл настроек settings.ini не найден и не удалось распарсить bitrix/.settings.php")
+        use_ini_fallback = True
+        config.read('settings.ini', encoding='utf-8')
 
     settings = {
         'database': {
+            'mode': 'truncate',
+            'tables': [],
+            'auth_plugin': None
+        },
+        'folders': {
+            'clean': [],
+            'copy_sources': [],
+            'copy_destinations': [],
+            'copy_user': '',
+            'preserve_dirs': [],
+            'preserve_files': []
+        },
+        'backup': {
+            'enable': True,
+            'backup_dir': ''
+        },
+        'security': {
+            'confirm_destructive_operations': True
+        }
+    }
+
+    # Заполняем секцию database
+    if use_ini_fallback:
+        settings['database'].update({
             'host': unquote_value(config.get('database', 'host', fallback='localhost')),
             'user': unquote_value(config.get('database', 'user', fallback='root')),
             'password': unquote_value(config.get('database', 'password', fallback='')),
-            'database_name': unquote_value(config.get('database', 'database_name', fallback='')),
-            'mode': unquote_value(config.get('database', 'mode', fallback='truncate')),
-            'tables': parse_quoted_list(config.get('database', 'tables', fallback='')),
-            'auth_plugin': unquote_value(config.get('database', 'auth_plugin', fallback=None))
-        },
-        'folders': {
-            'clean': parse_quoted_list(config.get('folders', 'clean', fallback='')),
-            'copy_sources': parse_quoted_list(config.get('folders', 'copy_sources', fallback='')),
-            'copy_destinations': parse_quoted_list(config.get('folders', 'copy_destinations', fallback='')),
-            'copy_user': unquote_value(config.get('folders', 'copy_user', fallback=''))
-        },
-        'backup': {
-            'enable': config.getboolean('backup', 'enable', fallback=True),
-            'backup_dir': unquote_value(config.get('backup', 'backup_dir', fallback=''))
-        },
-        'security': {
-            'confirm_destructive_operations': config.getboolean('security', 'confirm_destructive_operations',
-                                                                fallback=True)
-        }
-    }
+            'database_name': unquote_value(config.get('database', 'database_name', fallback=''))
+        })
+    else:
+        # Используем данные из .settings.php
+        settings['database'].update({
+            'host': bx_db_config['host'],
+            'user': bx_db_config['user'],
+            'password': bx_db_config['password'],
+            'database_name': bx_db_config['database']
+        })
+
+    # Остальные секции загружаются только из settings.ini, если они там есть
+    if use_ini_fallback or os.path.exists('settings.ini'):
+        if not use_ini_fallback:
+            config.read('settings.ini', encoding='utf-8')
+
+        # Папки для очистки
+        clean_raw = config.get('folders', 'clean', fallback='')
+        if clean_raw.strip():
+            settings['folders']['clean'] = [os.path.normpath(p) for p in parse_quoted_list(clean_raw)]
+
+        # Источники копирования
+        copy_src_raw = config.get('folders', 'copy_sources', fallback='')
+        if copy_src_raw.strip():
+            settings['folders']['copy_sources'] = [os.path.normpath(p) for p in parse_quoted_list(copy_src_raw)]
+
+        # Назначения копирования
+        copy_dst_raw = config.get('folders', 'copy_destinations', fallback='')
+        if copy_dst_raw.strip():
+            settings['folders']['copy_destinations'] = [os.path.normpath(p) for p in parse_quoted_list(copy_dst_raw)]
+
+        settings['folders']['copy_user'] = unquote_value(config.get('folders', 'copy_user', fallback=''))
+
+        # Сохраняемые пути (изменения из прошлых запросов)
+        preserve_dirs_raw = config.get('folders', 'preserve_dirs', fallback='')
+        if preserve_dirs_raw.strip():
+            settings['folders']['preserve_dirs'] = [os.path.normpath(p) for p in parse_quoted_list(preserve_dirs_raw)]
+
+        preserve_files_raw = config.get('folders', 'preserve_files', fallback='')
+        if preserve_files_raw.strip():
+            settings['folders']['preserve_files'] = [os.path.normpath(p) for p in parse_quoted_list(preserve_files_raw)]
+
+        # Резервное копирование
+        settings['backup']['enable'] = config.getboolean('backup', 'enable', fallback=True)
+        settings['backup']['backup_dir'] = unquote_value(config.get('backup', 'backup_dir', fallback=''))
+
+        # Безопасность
+        settings['security']['confirm_destructive_operations'] = config.getboolean(
+            'security', 'confirm_destructive_operations', fallback=True)
 
     return settings
 
@@ -149,10 +248,7 @@ def drop_all_tables(connection):
     """Удалить ВСЕ таблицы в базе данных"""
     try:
         with connection.cursor() as cursor:
-            # Временно отключаем проверку внешних ключей
             cursor.execute("SET FOREIGN_KEY_CHECKS = 0;")
-
-            # Получаем все таблицы
             tables = get_all_tables(connection)
 
             if not tables:
@@ -160,19 +256,13 @@ def drop_all_tables(connection):
                 return
 
             print(f"Найдено таблиц для удаления: {len(tables)}")
-
-            # Формируем и выполняем запрос на удаление всех таблиц
             drop_query = "DROP TABLE " + ", ".join(tables) + ";"
             cursor.execute(drop_query)
-
-            # Включаем проверку внешних ключей обратно
             cursor.execute("SET FOREIGN_KEY_CHECKS = 1;")
-
             print(f"Все таблицы ({len(tables)}) успешно удалены")
 
     except Exception as e:
         print(f"Ошибка при удалении таблиц: {str(e)}")
-        # Все равно включаем проверку внешних ключей при ошибке
         try:
             cursor.execute("SET FOREIGN_KEY_CHECKS = 1;")
         except:
@@ -184,13 +274,11 @@ def drop_specific_tables(connection, tables_list):
     try:
         with connection.cursor() as cursor:
             cursor.execute("SET FOREIGN_KEY_CHECKS = 0;")
-
             for table in tables_list:
                 cursor.execute(f"DROP TABLE IF EXISTS {table};")
                 print(f"Таблица {table} удалена")
-
             cursor.execute("SET FOREIGN_KEY_CHECKS = 1;")
-            print(f"Указанные таблицы ({len(tables_list)}) успешно удалены")
+            print(f"Удалено таблиц: {len(tables_list)}")
 
     except Exception as e:
         print(f"Ошибка при удалении таблиц: {str(e)}")
@@ -207,7 +295,6 @@ def truncate_tables(connection, tables_list):
             for table in tables_list:
                 cursor.execute(f"TRUNCATE TABLE {table};")
                 print(f"Таблица {table} очищена")
-
         connection.commit()
         print("Указанные таблицы успешно очищены")
 
@@ -218,7 +305,6 @@ def truncate_tables(connection, tables_list):
 def clean_database(settings):
     """Основная функция для работы с базой данных"""
     db_settings = settings['database']
-
     connection, error = create_db_connection(db_settings)
     if error:
         print(error)
@@ -233,7 +319,6 @@ def clean_database(settings):
                 if not confirm_destructive_operation("Будут удалены ВСЕ таблицы в базе данных!"):
                     print("Операция отменена пользователем")
                     return
-
             print("Режим: УДАЛЕНИЕ ВСЕХ ТАБЛИЦ")
             drop_all_tables(connection)
 
@@ -242,7 +327,6 @@ def clean_database(settings):
                 if not confirm_destructive_operation(f"Будут удалены таблицы: {', '.join(tables_list)}"):
                     print("Операция отменена пользователем")
                     return
-
             print("Режим: УДАЛЕНИЕ УКАЗАННЫХ ТАБЛИЦ")
             drop_specific_tables(connection, tables_list)
 
@@ -261,28 +345,76 @@ def clean_database(settings):
 
 
 def clean_folders(folders_to_clean, settings):
-    """Очистка указанных папок"""
-    if settings['security']['confirm_destructive_operations'] and folders_to_clean:
-        if not confirm_destructive_operation(f"Будет очищено содержимое папок: {', '.join(folders_to_clean)}"):
+    """Очистка указанных папок с сохранением исключений"""
+    if not folders_to_clean:
+        print("Нет папок для очистки")
+        return
+
+    folder_descriptions = []
+    for folder in folders_to_clean:
+        rel_dirs = ", ".join([f"'{d}'" for d in settings['folders'].get('preserve_dirs', [])]) if settings[
+            'folders'].get('preserve_dirs') else "нет"
+        rel_files = ", ".join([f"'{f}'" for f in settings['folders'].get('preserve_files', [])]) if settings[
+            'folders'].get('preserve_files') else "нет"
+        folder_descriptions.append(f"{folder} (папки: {rel_dirs}, файлы: {rel_files})")
+
+    if settings['security']['confirm_destructive_operations']:
+        if not confirm_destructive_operation(
+                f"Будет очищено содержимое папок:\n" + "\n".join(folder_descriptions)):
             print("Операция отменена пользователем")
             return
 
-    for folder in folders_to_clean:
+    preserve_dirs = [os.path.normpath(p) for p in settings['folders'].get('preserve_dirs', [])]
+    preserve_files = [os.path.normpath(p) for p in settings['folders'].get('preserve_files', [])]
+
+    for root_folder in folders_to_clean:
         try:
-            if os.path.exists(folder):
-                for item in os.listdir(folder):
-                    item_path = os.path.join(folder, item)
-                    if os.path.isfile(item_path):
-                        os.unlink(item_path)
-                        print(f"Удален файл: {item_path}")
-                    elif os.path.isdir(item_path):
-                        rmtree(item_path)
-                        print(f"Удалена папка: {item_path}")
-                print(f"Папка {folder} очищена")
-            else:
-                print(f"Папка не существует: {folder}")
+            if not os.path.exists(root_folder):
+                print(f"Папка не существует: {root_folder}")
+                continue
+
+            norm_root = os.path.normpath(root_folder)
+            print(f"\nНачинаем избирательную очистку: {root_folder}")
+
+            for item in os.listdir(root_folder):
+                item_path = os.path.join(root_folder, item)
+                norm_item_path = os.path.normpath(item_path)
+
+                is_preserved = False
+
+                # Проверка защищенных подпапок
+                for preserve_rel in preserve_dirs:
+                    full_preserve_path = os.path.normpath(os.path.join(norm_root, preserve_rel))
+                    if norm_item_path == full_preserve_path or norm_item_path.startswith(full_preserve_path + os.sep):
+                        is_preserved = True
+                        break
+
+                # Проверка защищенных файлов
+                if not is_preserved:
+                    for preserve_rel in preserve_files:
+                        full_preserve_path = os.path.normpath(os.path.join(norm_root, preserve_rel))
+                        if norm_item_path == full_preserve_path:
+                            is_preserved = True
+                            break
+
+                if not is_preserved:
+                    try:
+                        if os.path.isfile(item_path) or os.path.islink(item_path):
+                            os.unlink(item_path)
+                            print(f"Удален файл/ссылка: {item_path}")
+                        elif os.path.isdir(item_path):
+                            rmtree(item_path)
+                            print(f"Удалена папка: {item_path}")
+                    except Exception as e:
+                        print(f"Ошибка при удалении {item_path}: {str(e)}")
+                else:
+                    action = "папка" if os.path.isdir(item_path) else "файл"
+                    print(f"Сохранен(а) {action}: {item_path}")
+
+            print(f"Папка {root_folder} успешно очищена с учетом исключений")
+
         except Exception as e:
-            print(f"Ошибка при очистке {folder}: {str(e)}")
+            print(f"Критическая ошибка при обработке {root_folder}: {str(e)}")
 
 
 def copy_files_to_cleaned_folders(settings):
@@ -304,7 +436,6 @@ def copy_files_to_cleaned_folders(settings):
     for i, source_folder in enumerate(copy_sources):
         dest_folder = copy_destinations[i]
 
-        # Проверяем, что целевая папка была в списке очищаемых
         if dest_folder not in folders_to_clean:
             print(f"Предупреждение: целевая папка {dest_folder} не была в списке очищаемых")
             continue
@@ -326,20 +457,16 @@ def copy_files_to_cleaned_folders(settings):
 
             print(f"Копирование из {source_folder} в {dest_folder}")
 
-            # Копируем содержимое папки
             if os.path.isdir(source_folder):
                 for item in os.listdir(source_folder):
                     source_path = os.path.join(source_folder, item)
                     dest_path = os.path.join(dest_folder, item)
 
                     if copy_user:
-                        # Копирование от имени другого пользователя
                         if os.path.isdir(source_path):
-                            # Для папок используем rsync для сохранения прав
                             success, output = run_as_user(['rsync', '-ar', source_path + '/', dest_path + '/'],
                                                           copy_user)
                         else:
-                            # Для файлов используем cp
                             success, output = run_as_user(['cp', '-p', source_path, dest_path], copy_user)
 
                         if success:
@@ -347,7 +474,6 @@ def copy_files_to_cleaned_folders(settings):
                         else:
                             print(f"  Ошибка копирования {item}: {output}")
                     else:
-                        # Обычное копирование
                         if os.path.isdir(source_path):
                             if os.path.exists(dest_path):
                                 rmtree(dest_path)
@@ -366,7 +492,6 @@ def copy_files_to_cleaned_folders(settings):
 def show_database_info(settings):
     """Показать информацию о текущем состоянии базы данных"""
     db_settings = settings['database']
-
     connection, error = create_db_connection(db_settings)
     if error:
         print(error)
@@ -394,7 +519,6 @@ def create_backup(settings, source_folders):
         return None
 
     backup_dir = settings['backup']['backup_dir']
-
     if not backup_dir:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         backup_dir = f"/tmp/backup_{timestamp}"
@@ -439,6 +563,11 @@ def print_settings_summary(settings):
         if settings['folders']['copy_user']:
             print(f"Пользователь для копирования: {settings['folders']['copy_user']}")
 
+    if settings['folders']['preserve_dirs']:
+        print(f"Сохраняемые подпапки: {', '.join(settings['folders']['preserve_dirs'])}")
+    if settings['folders']['preserve_files']:
+        print(f"Сохраняемые файлы: {', '.join(settings['folders']['preserve_files'])}")
+
     print(f"Резервное копирование: {'включено' if settings['backup']['enable'] else 'отключено'}")
     if settings['backup']['enable'] and settings['backup']['backup_dir']:
         print(f"Папка для бэкапов: {settings['backup']['backup_dir']}")
@@ -461,19 +590,16 @@ def check_dependencies():
 
 if __name__ == "__main__":
     try:
-        # Проверяем зависимости
         deps_ok, deps_error = check_dependencies()
         if not deps_ok:
             print(f"Ошибка зависимостей: {deps_error}")
             sys.exit(1)
 
-        # Загружаем настройки
         settings = load_settings()
 
         print("Начало очистки...")
         print_settings_summary(settings)
 
-        # Создаем резервную копию перед очисткой
         if settings['backup']['enable']:
             print("\n=== Резервное копирование ===")
             backup_folders = list(set(settings['folders']['clean'] + settings['folders']['copy_sources']))
@@ -482,29 +608,24 @@ if __name__ == "__main__":
             backup_path = None
             print("\nРезервное копирование отключено в настройках")
 
-        # Показываем информацию о БД до очистки
         print("\n=== Состояние БД ДО очистки ===")
         show_database_info(settings)
 
-        # Работа с базой данных
         if settings['database']['database_name']:
             print(f"\n=== Работа с базой данных (режим: {settings['database']['mode']}) ===")
             clean_database(settings)
         else:
             print("Имя базы данных не указано, пропускаем очистку БД")
 
-        # Показываем информацию о БД после очистки
         print("\n=== Состояние БД ПОСЛЕ очистки ===")
         show_database_info(settings)
 
-        # Очистка файлов
         if settings['folders']['clean']:
             print("\n=== Очистка файловой системы ===")
             clean_folders(settings['folders']['clean'], settings)
         else:
             print("Нет папок для очистки")
 
-        # Копирование файлов в очищенные папки
         if settings['folders']['copy_sources'] and settings['folders']['copy_destinations']:
             print("\n=== Копирование файлов в очищенные папки ===")
             copy_files_to_cleaned_folders(settings)
