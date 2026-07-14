@@ -672,11 +672,20 @@ if __name__ == "__main__":
         print("\n=== Состояние БД ДО очистки ===")
         show_database_info(settings)
 
-        if settings['database']['database_name']:
-            print(f"\n=== Работа с базой данных (режим: {settings['database']['mode']}) ===")
-            clean_database(settings)
+        db_settings = settings['database']
+
+        print(f"\n=== Работа с базой данных (режим: {db_settings.get('mode', 'не указан')}) ===")
+
+        # Явно выводим параметры для проверки глазами
+        print(f"[DEBUG] Target DB Name: '{db_settings.get('database_name')}'")
+        print(f"[DEBUG] Mode selected: '{db_settings.get('mode')}'")
+        print(f"[DEBUG] Tables list: {db_settings.get('tables')}")
+
+        if not db_settings.get('database_name'):
+            print("[ERROR] Имя базы данных ('database_name') пустое. Очистка БД пропущена.")
         else:
-            print("Имя базы данных не указано, пропускаем очистку БД")
+            # Вызываем функцию очистки только если имя БД задано
+            clean_database(settings)
 
         print("\n=== Состояние БД ПОСЛЕ очистки ===")
         show_database_info(settings)
