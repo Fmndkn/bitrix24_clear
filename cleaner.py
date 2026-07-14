@@ -11,7 +11,6 @@ import re
 from datetime import datetime
 from shutil import rmtree, copytree, copy2
 import ast
-import subprocess
 import tempfile
 
 
@@ -31,39 +30,39 @@ def parse_quoted_list(value):
     if not value:
         return []
 
-    # Регулярное выражение для поиска значений в кавычках или без
     pattern = r'\"[^\"]+\"|\'[^\']+\'|[^,\s]+'
     matches = re.findall(pattern, value)
 
     result = []
     for match in matches:
-        # Удаляем кавычки если они есть
         cleaned_value = unquote_value(match)
         if cleaned_value:
             result.append(cleaned_value)
-
     return result
 
 
-def parse_bitrix_settings(php_file_path):
+# --- ИЗМЕНЕННАЯ ФУНКЦИЯ: теперь принимает путь к корню сайта ---
+def parse_bitrix_settings(site_root_path):
     """Выполняет .settings.php через PHP-интерпретатор для получения чистых данных"""
+
+    php_file_path = os.path.join(site_root_path, 'bitrix', '.settings.php')
+
     if not os.path.exists(php_file_path):
+        print(f"[DEBUG] Файл {php_file_path} не найден.")
         return None
 
-    # Проверяем наличие системного php
     try:
+        # Проверяем наличие системного php
         subprocess.run(['php', '-v'], capture_output=True, check=True)
     except (subprocess.CalledProcessError, FileNotFoundError):
-        print("[ERROR] На сервере не найден исполняемый файл 'php'. Невозможно прочитать зашифрованные настройки.")
+        print("[ERROR] На сервере не найден исполняемый файл 'php'. Невозможно прочитать настройки Bitrix.")
         return None
 
-    # Создаем временный PHP-скрипт для безопасного чтения массива
     php_code = f"""
 <?php
 $config = include('{php_file_path}');
 $connections = $config['connections']['value']['default'] ?? null;
 if ($connections) {{
-    // Преобразуем в JSON, экранируя спецсимволы
     echo json_encode([
         'host' => $connections['host'],
         'database' => $connections['database'],
@@ -86,14 +85,13 @@ if ($connections) {{
             capture_output=True,
             text=True,
             timeout=5,
-            cwd=os.path.dirname(php_file_path)
+            cwd=site_root_path  # Важно: запускаем из папки сайта
         )
 
-        # Удаляем временный файл
         os.unlink(tmp_path)
 
         if result.returncode != 0:
-            print(f"[ERROR] Ошибка выполнения PHP: {result.stderr.strip()}")
+            print(f"[ERROR] Ошибка выполнения PHP-кода:\n{result.stderr.strip()}")
             return None
 
         output = result.stdout.strip()
@@ -103,7 +101,6 @@ if ($connections) {{
         import json
         data = json.loads(output)
 
-        # Базовая проверка валидности
         if all(data.values()):
             return data
         return None
@@ -115,49 +112,61 @@ if ($connections) {{
 
 def load_settings():
     """Загрузка настроек из settings.ini или bitrix/.settings.php"""
-
-    # Корректный относительный путь до файла Bitrix
-    bx_php_path = os.path.join(os.getcwd(), 'bitrix', '.settings.php')
-
-    print(f"[DEBUG] Поиск конфигурационного файла Bitrix по пути: {bx_php_path}")
-
-    bx_db_config = parse_bitrix_settings(bx_php_path)
-
     config = configparser.ConfigParser(interpolation=None)
-    use_ini_fallback = False
 
-    if not bx_db_config:
-        print("[WARNING] Не удалось извлечь настройки из .settings.php. Попытка чтения settings.ini...")
-        if not os.path.exists('settings.ini'):
-            raise FileNotFoundError("Файл настроек settings.ini не найден.")
-        use_ini_fallback = True
-        config.read('settings.ini', encoding='utf-8')
-    else:
-        print("[SUCCESS] Настройки успешно загружены из bitrix/.settings.php")
+    if not os.path.exists('settings.ini'):
+        raise FileNotFoundError("Файл настроек settings.ini не найден")
+
+    config.read('settings.ini', encoding='utf-8')
 
     settings = {
-        'database': {
-            'mode': 'truncate',
-            'tables': [],
-            'auth_plugin': None
-        },
+        'database': {'mode': 'truncate', 'tables': [], 'auth_plugin': None},
         'folders': {
-            'clean': [],
-            'copy_sources': [],
-            'copy_destinations': [],
-            'copy_user': '',
-            'preserve_dirs': [],
-            'preserve_files': []
+            'clean': [], 'copy_sources': [], 'copy_destinations': [],
+            'copy_user': '', 'preserve_dirs': [], 'preserve_files': []
         },
-        'backup': {
-            'enable': True,
-            'backup_dir': ''
-        },
-        'security': {
-            'confirm_destructive_operations': True
-        }
+        'backup': {'enable': True, 'backup_dir': ''},
+        'security': {'confirm_destructive_operations': True}
     }
 
+    # Определяем корень сайта по первой папке в списке clean
+    raw_clean_paths = config.get('folders', 'clean', fallback='')
+    site_root = ""
+
+    if raw_clean_paths.strip():
+        first_clean_path = parse_quoted_list(raw_clean_paths)[0]
+        # Если путь относительный, делаем его абсолютным от места запуска скрипта
+        if not os.path.isabs(first_clean_path):
+            site_root = os.path.abspath(first_clean_path)
+        else:
+            site_root = first_clean_path
+
+        # Поднимаемся вверх до тех пор, пока не найдем папку bitrix
+        current_check = site_root
+        while current_check != '/':
+            if os.path.exists(os.path.join(current_check, 'bitrix')):
+                site_root = current_check
+                break
+            parent = os.path.dirname(current_check)
+            if parent == current_check:
+                break
+            current_check = parent
+    else:
+        site_root = os.getcwd()  # Fallback на текущую директорию
+
+    print(f"[INFO] Корень сайта определен как: {site_root}")
+
+    # Приоритет 1: Пробуем взять настройки из родного файла Bitrix
+    bx_db_config = parse_bitrix_settings(site_root)
+
+    use_ini_fallback = False
+    if not bx_db_config:
+        print("[WARNING] Не удалось извлечь данные из bitrix/.settings.php. Используем settings.ini...")
+        use_ini_fallback = True
+    else:
+        print("[SUCCESS] Настройки БД успешно загружены из bitrix/.settings.php")
+
+    # Заполняем секцию database
     if use_ini_fallback:
         settings['database'].update({
             'host': unquote_value(config.get('database', 'host', fallback='localhost')),
@@ -173,38 +182,34 @@ def load_settings():
             'database_name': bx_db_config['database']
         })
 
-    # Загрузка остальных параметров из INI (если он есть рядом)
-    if use_ini_fallback or os.path.exists('settings.ini'):
-        if not use_ini_fallback:
-            config.read('settings.ini', encoding='utf-8')
+    # Загружаем остальные параметры ТОЛЬКО из settings.ini (пути там всегда свои)
+    clean_raw = config.get('folders', 'clean', fallback='')
+    if clean_raw.strip():
+        settings['folders']['clean'] = [os.path.normpath(p) for p in parse_quoted_list(clean_raw)]
 
-        clean_raw = config.get('folders', 'clean', fallback='')
-        if clean_raw.strip():
-            settings['folders']['clean'] = [os.path.normpath(p) for p in parse_quoted_list(clean_raw)]
+    copy_src_raw = config.get('folders', 'copy_sources', fallback='')
+    if copy_src_raw.strip():
+        settings['folders']['copy_sources'] = [os.path.normpath(p) for p in parse_quoted_list(copy_src_raw)]
 
-        copy_src_raw = config.get('folders', 'copy_sources', fallback='')
-        if copy_src_raw.strip():
-            settings['folders']['copy_sources'] = [os.path.normpath(p) for p in parse_quoted_list(copy_src_raw)]
+    copy_dst_raw = config.get('folders', 'copy_destinations', fallback='')
+    if copy_dst_raw.strip():
+        settings['folders']['copy_destinations'] = [os.path.normpath(p) for p in parse_quoted_list(copy_dst_raw)]
 
-        copy_dst_raw = config.get('folders', 'copy_destinations', fallback='')
-        if copy_dst_raw.strip():
-            settings['folders']['copy_destinations'] = [os.path.normpath(p) for p in parse_quoted_list(copy_dst_raw)]
+    settings['folders']['copy_user'] = unquote_value(config.get('folders', 'copy_user', fallback=''))
 
-        settings['folders']['copy_user'] = unquote_value(config.get('folders', 'copy_user', fallback=''))
+    preserve_dirs_raw = config.get('folders', 'preserve_dirs', fallback='')
+    if preserve_dirs_raw.strip():
+        settings['folders']['preserve_dirs'] = [os.path.normpath(p) for p in parse_quoted_list(preserve_dirs_raw)]
 
-        preserve_dirs_raw = config.get('folders', 'preserve_dirs', fallback='')
-        if preserve_dirs_raw.strip():
-            settings['folders']['preserve_dirs'] = [os.path.normpath(p) for p in parse_quoted_list(preserve_dirs_raw)]
+    preserve_files_raw = config.get('folders', 'preserve_files', fallback='')
+    if preserve_files_raw.strip():
+        settings['folders']['preserve_files'] = [os.path.normpath(p) for p in parse_quoted_list(preserve_files_raw)]
 
-        preserve_files_raw = config.get('folders', 'preserve_files', fallback='')
-        if preserve_files_raw.strip():
-            settings['folders']['preserve_files'] = [os.path.normpath(p) for p in parse_quoted_list(preserve_files_raw)]
+    settings['backup']['enable'] = config.getboolean('backup', 'enable', fallback=True)
+    settings['backup']['backup_dir'] = unquote_value(config.get('backup', 'backup_dir', fallback=''))
 
-        settings['backup']['enable'] = config.getboolean('backup', 'enable', fallback=True)
-        settings['backup']['backup_dir'] = unquote_value(config.get('backup', 'backup_dir', fallback=''))
-
-        settings['security']['confirm_destructive_operations'] = config.getboolean(
-            'security', 'confirm_destructive_operations', fallback=True)
+    settings['security']['confirm_destructive_operations'] = config.getboolean(
+        'security', 'confirm_destructive_operations', fallback=True)
 
     return settings
 
