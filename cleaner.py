@@ -11,6 +11,8 @@ import re
 from datetime import datetime
 from shutil import rmtree, copytree, copy2
 import ast
+import subprocess
+import tempfile
 
 
 def unquote_value(value):
@@ -44,73 +46,71 @@ def parse_quoted_list(value):
 
 
 def parse_bitrix_settings(php_file_path):
-    """Безопасно парсит bitrix/.settings.php и извлекает данные подключения к БД"""
+    """Выполняет .settings.php через PHP-интерпретатор для получения чистых данных"""
     if not os.path.exists(php_file_path):
         return None
 
+    # Проверяем наличие системного php
     try:
-        with open(php_file_path, 'r', encoding='utf-8') as f:
-            content = f.read()
+        subprocess.run(['php', '-v'], capture_output=True, check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print("[ERROR] На сервере не найден исполняемый файл 'php'. Невозможно прочитать зашифрованные настройки.")
+        return None
 
-        # Находим начало массива конфигурации
-        start_match = re.search(r"return array\s*$", content)
-        if not start_match:
+    # Создаем временный PHP-скрипт для безопасного чтения массива
+    php_code = f"""
+<?php
+$config = include('{php_file_path}');
+$connections = $config['connections']['value']['default'] ?? null;
+if ($connections) {{
+    // Преобразуем в JSON, экранируя спецсимволы
+    echo json_encode([
+        'host' => $connections['host'],
+        'database' => $connections['database'],
+        'user' => $connections['login'],
+        'password' => $connections['password']
+    ]);
+}} else {{
+    echo "null";
+}}
+?>
+"""
+
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.php', delete=False, encoding='utf-8') as tmp:
+            tmp.write(php_code)
+            tmp_path = tmp.name
+
+        result = subprocess.run(
+            ['php', tmp_path],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            cwd=os.path.dirname(php_file_path)
+        )
+
+        # Удаляем временный файл
+        os.unlink(tmp_path)
+
+        if result.returncode != 0:
+            print(f"[ERROR] Ошибка выполнения PHP: {result.stderr.strip()}")
             return None
 
-        # Используем стек для нахождения закрывающей скобки всего массива
-        stack = []
-        end_pos = -1
-        for i in range(start_match.start(), len(content)):
-            if content[i] == '(':
-                stack.append('(')
-            elif content[i] == ')':
-                stack.pop()
-                if not stack:
-                    end_pos = i
-                    break
-
-        if end_pos == -1:
+        output = result.stdout.strip()
+        if output == "null" or not output:
             return None
 
-        # Извлекаем только тело массива
-        php_array_str = content[start_match.end():end_pos]
+        import json
+        data = json.loads(output)
 
-        # Преобразуем синтаксис PHP -> Python:
-        # 1. Одинарные кавычки в двойные (чтобы не конфликтовали со строками python)
-        py_str = php_array_str.replace("'", '"')
-        # 2. Заменяем => на : для JSON-подобного вида
-        py_str = re.sub(r'=>\s*', ': ', py_str)
-        # 3. Удаляем служебные комментарии битрикса BEGIN/END GENERATED...
-        py_str = re.sub(r'"[^"]*BEGIN GENERATED PUSH SETTINGS.*?\n.*?END GENERATED PUSH SETTINGS.*?"\s*,?\s*', '',
-                        py_str, flags=re.DOTALL)
-
-        # Приводим к валидному JSON/YAML виду (удаляем висячие запятые перед })
-        py_str = re.sub(r',\s*([$$}])', r'\1', py_str)
-
-        # Пробуем распарсить как строку Python словаря
-        data = ast.literal_eval(f"{{{py_str}}}")
-
-        # Переходим по структуре Битрикс: connections -> value -> default
-        conn_data = data.get('connections', {}).get('value', {}).get('default', {})
-
-        if not conn_data:
-            return None
-
-        db_config = {
-            'host': conn_data.get('host'),
-            'database': conn_data.get('database'),
-            'user': conn_data.get('login'),  # В файле ключ называется login
-            'password': conn_data.get('password')
-        }
-
-        # Проверка на пустые значения
-        if all(db_config.values()):
-            return db_config
+        # Базовая проверка валидности
+        if all(data.values()):
+            return data
+        return None
 
     except Exception as e:
-        print(f"Ошибка при безопасном разборе {php_file_path}: {str(e)}")
-
-    return None
+        print(f"[ERROR] Критическая ошибка при вызове PHP: {str(e)}")
+        return None
 
 
 def load_settings():
