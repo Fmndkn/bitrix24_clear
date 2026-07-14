@@ -112,15 +112,17 @@ if ($connections) {{
 
 def load_settings():
     """Загрузка настроек из settings.ini или bitrix/.settings.php"""
+
     config = configparser.ConfigParser(interpolation=None)
 
     if not os.path.exists('settings.ini'):
         raise FileNotFoundError("Файл настроек settings.ini не найден")
 
+    # Читаем файл сразу, чтобы получить список папок 'clean' до парсинга БД
     config.read('settings.ini', encoding='utf-8')
 
     settings = {
-        'database': {'mode': 'truncate', 'tables': [], 'auth_plugin': None},
+        'database': {'mode': '', 'tables': [], 'auth_plugin': None},
         'folders': {
             'clean': [], 'copy_sources': [], 'copy_destinations': [],
             'copy_user': '', 'preserve_dirs': [], 'preserve_files': []
@@ -129,34 +131,38 @@ def load_settings():
         'security': {'confirm_destructive_operations': True}
     }
 
-    # Определяем корень сайта по первой папке в списке clean
+    # --- ОПРЕДЕЛЕНИЕ КОРНЯ САЙТА ---
     raw_clean_paths = config.get('folders', 'clean', fallback='')
     site_root = ""
 
     if raw_clean_paths.strip():
         first_clean_path = parse_quoted_list(raw_clean_paths)[0]
-        # Если путь относительный, делаем его абсолютным от места запуска скрипта
-        if not os.path.isabs(first_clean_path):
-            site_root = os.path.abspath(first_clean_path)
-        else:
-            site_root = first_clean_path
 
-        # Поднимаемся вверх до тех пор, пока не найдем папку bitrix
-        current_check = site_root
+        # Делаем путь абсолютным относительно места запуска скрипта
+        abs_first_path = os.path.abspath(first_clean_path)
+
+        # Поднимаемся вверх по дереву каталогов, пока не найдем папку 'bitrix'
+        current_check = abs_first_path
         while current_check != '/':
-            if os.path.exists(os.path.join(current_check, 'bitrix')):
+            potential_bitrix = os.path.join(current_check, 'bitrix')
+            if os.path.isdir(potential_bitrix):
                 site_root = current_check
                 break
+
             parent = os.path.dirname(current_check)
-            if parent == current_check:
+            if parent == current_check:  # Достигли корня файловой системы
                 break
             current_check = parent
+
+        # Если битрикс так и не нашли (например, чистим /tmp), берем текущую директорию
+        if not site_root:
+            site_root = os.getcwd()
     else:
-        site_root = os.getcwd()  # Fallback на текущую директорию
+        site_root = os.getcwd()
 
     print(f"[INFO] Корень сайта определен как: {site_root}")
 
-    # Приоритет 1: Пробуем взять настройки из родного файла Bitrix
+    # --- ПАРСИНГ НАСТРОЕК БАЗЫ ДАННЫХ ---
     bx_db_config = parse_bitrix_settings(site_root)
 
     use_ini_fallback = False
@@ -166,7 +172,6 @@ def load_settings():
     else:
         print("[SUCCESS] Настройки БД успешно загружены из bitrix/.settings.php")
 
-    # Заполняем секцию database
     if use_ini_fallback:
         settings['database'].update({
             'host': unquote_value(config.get('database', 'host', fallback='localhost')),
@@ -182,7 +187,21 @@ def load_settings():
             'database_name': bx_db_config['database']
         })
 
-    # Загружаем остальные параметры ТОЛЬКО из settings.ini (пути там всегда свои)
+    # --- ЧТЕНИЕ ОСТАЛЬНЫХ ПАРАМЕТРОВ ИЗ SETTINGS.INI ---
+
+    # ВАЖНО: Здесь убрано жесткое присваивание mode = 'truncate'.
+    # Теперь режим берется строго из файла.
+    raw_mode = config.get('database', 'mode', fallback='truncate').strip().lower()
+    settings['database']['mode'] = raw_mode
+
+    tables_raw = config.get('database', 'tables', fallback='')
+    if tables_raw.strip():
+        settings['database']['tables'] = parse_quoted_list(tables_raw)
+
+    auth_plugin_raw = config.get('database', 'auth_plugin', fallback='')
+    if auth_plugin_raw.strip():
+        settings['database']['auth_plugin'] = unquote_value(auth_plugin_raw)
+
     clean_raw = config.get('folders', 'clean', fallback='')
     if clean_raw.strip():
         settings['folders']['clean'] = [os.path.normpath(p) for p in parse_quoted_list(clean_raw)]
