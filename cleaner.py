@@ -14,7 +14,6 @@ import ast
 import tempfile
 import pwd
 import grp
-import shutil
 
 def get_uid_gid(user_str):
     """Получает UID и GID пользователя по имени"""
