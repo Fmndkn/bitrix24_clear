@@ -379,18 +379,20 @@ def clean_database(settings):
 
 
 def clean_folders(folders_to_clean, settings):
-    """Очистка указанных папок с сохранением исключений"""
+    """Очистка указанных папок с сохранением критичных файлов Bitrix"""
     if not folders_to_clean:
         print("Нет папок для очистки")
         return
 
+    # Получаем список того, что нельзя трогать
+    preserve_dirs = [os.path.normpath(p) for p in settings['folders'].get('preserve_dirs', [])]
+    preserve_files = [os.path.normpath(p) for p in settings['folders'].get('preserve_files', [])]
+
     folder_descriptions = []
     for folder in folders_to_clean:
-        rel_dirs = ", ".join([f"'{d}'" for d in settings['folders'].get('preserve_dirs', [])]) if settings[
-            'folders'].get('preserve_dirs') else "нет"
-        rel_files = ", ".join([f"'{f}'" for f in settings['folders'].get('preserve_files', [])]) if settings[
-            'folders'].get('preserve_files') else "нет"
-        folder_descriptions.append(f"{folder} (папки: {rel_dirs}, файлы: {rel_files})")
+        rel_dirs = ", ".join([f"'{d}'" for d in preserve_dirs]) if preserve_dirs else "нет"
+        rel_files = ", ".join([f"'{f}'" for f in preserve_files]) if preserve_files else "нет"
+        folder_descriptions.append(f"{folder} (сохранить папки: {rel_dirs}, файлы: {rel_files})")
 
     if settings['security']['confirm_destructive_operations']:
         if not confirm_destructive_operation(
@@ -398,54 +400,70 @@ def clean_folders(folders_to_clean, settings):
             print("Операция отменена пользователем")
             return
 
-    preserve_dirs = [os.path.normpath(p) for p in settings['folders'].get('preserve_dirs', [])]
-    preserve_files = [os.path.normpath(p) for p in settings['folders'].get('preserve_files', [])]
-
     for root_folder in folders_to_clean:
         try:
-            if not os.path.exists(root_folder):
-                print(f"Папка не существует: {root_folder}")
+            norm_root = os.path.normpath(root_folder)
+
+            if not os.path.exists(norm_root):
+                print(f"Папка не существует: {norm_root}")
                 continue
 
-            norm_root = os.path.normpath(root_folder)
-            print(f"\nНачинаем избирательную очистку: {root_folder}")
+            print(f"\nНачинаем рекурсивную очистку: {norm_root}")
 
-            for item in os.listdir(root_folder):
-                item_path = os.path.join(root_folder, item)
-                norm_item_path = os.path.normpath(item_path)
+            # Для проверки путей нам нужен корень сайта (верхняя точка отсчета).
+            # Берем его как общую часть всех путей очистки или просто CWD, если чистим одну папку.
+            site_base = os.path.commonpath([norm_root] +
+                                           [os.path.normpath(p) for p in settings['folders']['clean']])
 
-                is_preserved = False
+            for current_dir, subdirs, files in os.walk(norm_root, topdown=True):
 
-                # Проверка защищенных подпапок
-                for preserve_rel in preserve_dirs:
-                    full_preserve_path = os.path.normpath(os.path.join(norm_root, preserve_rel))
-                    if norm_item_path == full_preserve_path or norm_item_path.startswith(full_preserve_path + os.sep):
-                        is_preserved = True
-                        break
+                # --- ОБРАБОТКА ПОДПАПОК ---
+                # Изменяем список subdirs прямо в цикле walk, чтобы он не зашел в защищенные папки
+                dirs_to_remove = []
+                for i, dirname in enumerate(subdirs):
+                    dir_abs_path = os.path.join(current_dir, dirname)
 
-                # Проверка защищенных файлов
-                if not is_preserved:
-                    for preserve_rel in preserve_files:
-                        full_preserve_path = os.path.normpath(os.path.join(norm_root, preserve_rel))
-                        if norm_item_path == full_preserve_path:
-                            is_preserved = True
+                    is_protected = False
+                    # Проверяем по списку relative-путей (напр. bitrix/php_interface)
+                    for preserve_rel in preserve_dirs:
+                        full_preserve_abs = os.path.normpath(os.path.join(site_base, preserve_rel))
+
+                        # Если это сама защищенная папка ИЛИ любая папка ВНУТРИ нее
+                        if dir_abs_path == full_preserve_abs or dir_abs_path.startswith(full_preserve_abs + os.sep):
+                            is_protected = True
                             break
 
-                if not is_preserved:
-                    try:
-                        if os.path.isfile(item_path) or os.path.islink(item_path):
-                            os.unlink(item_path)
-                            print(f"Удален файл/ссылка: {item_path}")
-                        elif os.path.isdir(item_path):
-                            rmtree(item_path)
-                            print(f"Удалена папка: {item_path}")
-                    except Exception as e:
-                        print(f"Ошибка при удалении {item_path}: {str(e)}")
-                else:
-                    action = "папка" if os.path.isdir(item_path) else "файл"
-                    print(f"Сохранен(а) {action}: {item_path}")
+                    if is_protected:
+                        # Сообщаем walk'у пропустить эту ветку при обходе
+                        subdirs[i] = None
+                    else:
+                        dirs_to_remove.append(dirname)
 
-            print(f"Папка {root_folder} успешно очищена с учетом исключений")
+                # Удаляем только те папки, которые не защищены
+                for dirname in dirs_to_remove:
+                    if dirname is not None:
+                        path_to_delete = os.path.join(current_dir, dirname)
+                        rmtree(path_to_delete)
+                        print(f"Удалена папка: {path_to_delete}")
+
+                # --- ОБРАБОТКА ФАЙЛОВ В ТЕКУЩЕЙ ПАПКЕ ---
+                for filename in files:
+                    file_abs_path = os.path.join(current_dir, filename)
+
+                    is_protected_file = False
+                    for preserve_rel in preserve_files:
+                        full_preserve_abs = os.path.normpath(os.path.join(site_base, preserve_rel))
+                        if file_abs_path == full_preserve_abs:
+                            is_protected_file = True
+                            break
+
+                    if not is_protected_file:
+                        os.unlink(file_abs_path)
+                        print(f"Удален файл: {file_abs_path}")
+                    else:
+                        print(f"Сохранен файл: {file_abs_path}")
+
+            print(f"Папка {norm_root} успешно очищена с учетом исключений")
 
         except Exception as e:
             print(f"Критическая ошибка при обработке {root_folder}: {str(e)}")
