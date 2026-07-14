@@ -10,6 +10,7 @@ import sys
 import re
 from datetime import datetime
 from shutil import rmtree, copytree, copy2
+import ast
 
 
 def unquote_value(value):
@@ -43,7 +44,7 @@ def parse_quoted_list(value):
 
 
 def parse_bitrix_settings(php_file_path):
-    """Парсит bitrix/.settings.php и извлекает данные подключения к БД"""
+    """Безопасно парсит bitrix/.settings.php и извлекает данные подключения к БД"""
     if not os.path.exists(php_file_path):
         return None
 
@@ -51,52 +52,88 @@ def parse_bitrix_settings(php_file_path):
         with open(php_file_path, 'r', encoding='utf-8') as f:
             content = f.read()
 
-        # Ищем блок connections
-        conn_match = re.search(r"'connections'\s*=>\s*array\s*$(.*?)$$;", content, re.DOTALL | re.MULTILINE)
-        if not conn_match:
+        # Находим начало массива конфигурации
+        start_match = re.search(r"return array\s*$", content)
+        if not start_match:
             return None
 
-        conn_block = conn_match.group(1)
+        # Используем стек для нахождения закрывающей скобки всего массива
+        stack = []
+        end_pos = -1
+        for i in range(start_match.start(), len(content)):
+            if content[i] == '(':
+                stack.append('(')
+            elif content[i] == ')':
+                stack.pop()
+                if not stack:
+                    end_pos = i
+                    break
 
-        # Извлекаем значения по ключам внутри массива default
-        def extract_value(key):
-            # Учитываем возможные экранирования и пробелы
-            pattern = rf"'{key}'\s*=>\s*'([^']*)'"
-            match = re.search(pattern, conn_block)
-            return match.group(1) if match else None
+        if end_pos == -1:
+            return None
+
+        # Извлекаем только тело массива
+        php_array_str = content[start_match.end():end_pos]
+
+        # Преобразуем синтаксис PHP -> Python:
+        # 1. Одинарные кавычки в двойные (чтобы не конфликтовали со строками python)
+        py_str = php_array_str.replace("'", '"')
+        # 2. Заменяем => на : для JSON-подобного вида
+        py_str = re.sub(r'=>\s*', ': ', py_str)
+        # 3. Удаляем служебные комментарии битрикса BEGIN/END GENERATED...
+        py_str = re.sub(r'"[^"]*BEGIN GENERATED PUSH SETTINGS.*?\n.*?END GENERATED PUSH SETTINGS.*?"\s*,?\s*', '',
+                        py_str, flags=re.DOTALL)
+
+        # Приводим к валидному JSON/YAML виду (удаляем висячие запятые перед })
+        py_str = re.sub(r',\s*([$$}])', r'\1', py_str)
+
+        # Пробуем распарсить как строку Python словаря
+        data = ast.literal_eval(f"{{{py_str}}}")
+
+        # Переходим по структуре Битрикс: connections -> value -> default
+        conn_data = data.get('connections', {}).get('value', {}).get('default', {})
+
+        if not conn_data:
+            return None
 
         db_config = {
-            'host': extract_value('host'),
-            'database': extract_value('database'),
-            'user': extract_value('login'),  # В .settings.php используется login
-            'password': extract_value('password')
+            'host': conn_data.get('host'),
+            'database': conn_data.get('database'),
+            'user': conn_data.get('login'),  # В файле ключ называется login
+            'password': conn_data.get('password')
         }
 
         # Проверка на пустые значения
         if all(db_config.values()):
             return db_config
-        return None
 
     except Exception as e:
-        print(f"Ошибка при чтении {php_file_path}: {str(e)}")
-        return None
+        print(f"Ошибка при безопасном разборе {php_file_path}: {str(e)}")
+
+    return None
 
 
 def load_settings():
     """Загрузка настроек из settings.ini или bitrix/.settings.php"""
 
-    # Приоритет 1: Пробуем взять настройки из родного файла Bitrix
-    bx_db_config = parse_bitrix_settings(os.path.join('bitrix', '.settings.php'))
+    # Корректный относительный путь до файла Bitrix
+    bx_php_path = os.path.join(os.getcwd(), 'bitrix', '.settings.php')
+
+    print(f"[DEBUG] Поиск конфигурационного файла Bitrix по пути: {bx_php_path}")
+
+    bx_db_config = parse_bitrix_settings(bx_php_path)
 
     config = configparser.ConfigParser(interpolation=None)
     use_ini_fallback = False
 
     if not bx_db_config:
-        # Если битрикс-файл не найден или поврежден, пробуем INI
+        print("[WARNING] Не удалось извлечь настройки из .settings.php. Попытка чтения settings.ini...")
         if not os.path.exists('settings.ini'):
-            raise FileNotFoundError("Файл настроек settings.ini не найден и не удалось распарсить bitrix/.settings.php")
+            raise FileNotFoundError("Файл настроек settings.ini не найден.")
         use_ini_fallback = True
         config.read('settings.ini', encoding='utf-8')
+    else:
+        print("[SUCCESS] Настройки успешно загружены из bitrix/.settings.php")
 
     settings = {
         'database': {
@@ -121,7 +158,6 @@ def load_settings():
         }
     }
 
-    # Заполняем секцию database
     if use_ini_fallback:
         settings['database'].update({
             'host': unquote_value(config.get('database', 'host', fallback='localhost')),
@@ -130,7 +166,6 @@ def load_settings():
             'database_name': unquote_value(config.get('database', 'database_name', fallback=''))
         })
     else:
-        # Используем данные из .settings.php
         settings['database'].update({
             'host': bx_db_config['host'],
             'user': bx_db_config['user'],
@@ -138,29 +173,25 @@ def load_settings():
             'database_name': bx_db_config['database']
         })
 
-    # Остальные секции загружаются только из settings.ini, если они там есть
+    # Загрузка остальных параметров из INI (если он есть рядом)
     if use_ini_fallback or os.path.exists('settings.ini'):
         if not use_ini_fallback:
             config.read('settings.ini', encoding='utf-8')
 
-        # Папки для очистки
         clean_raw = config.get('folders', 'clean', fallback='')
         if clean_raw.strip():
             settings['folders']['clean'] = [os.path.normpath(p) for p in parse_quoted_list(clean_raw)]
 
-        # Источники копирования
         copy_src_raw = config.get('folders', 'copy_sources', fallback='')
         if copy_src_raw.strip():
             settings['folders']['copy_sources'] = [os.path.normpath(p) for p in parse_quoted_list(copy_src_raw)]
 
-        # Назначения копирования
         copy_dst_raw = config.get('folders', 'copy_destinations', fallback='')
         if copy_dst_raw.strip():
             settings['folders']['copy_destinations'] = [os.path.normpath(p) for p in parse_quoted_list(copy_dst_raw)]
 
         settings['folders']['copy_user'] = unquote_value(config.get('folders', 'copy_user', fallback=''))
 
-        # Сохраняемые пути (изменения из прошлых запросов)
         preserve_dirs_raw = config.get('folders', 'preserve_dirs', fallback='')
         if preserve_dirs_raw.strip():
             settings['folders']['preserve_dirs'] = [os.path.normpath(p) for p in parse_quoted_list(preserve_dirs_raw)]
@@ -169,11 +200,9 @@ def load_settings():
         if preserve_files_raw.strip():
             settings['folders']['preserve_files'] = [os.path.normpath(p) for p in parse_quoted_list(preserve_files_raw)]
 
-        # Резервное копирование
         settings['backup']['enable'] = config.getboolean('backup', 'enable', fallback=True)
         settings['backup']['backup_dir'] = unquote_value(config.get('backup', 'backup_dir', fallback=''))
 
-        # Безопасность
         settings['security']['confirm_destructive_operations'] = config.getboolean(
             'security', 'confirm_destructive_operations', fallback=True)
 
