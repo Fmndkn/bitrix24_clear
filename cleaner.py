@@ -12,7 +12,32 @@ from datetime import datetime
 from shutil import rmtree, copytree, copy2
 import ast
 import tempfile
+import pwd
+import grp
+import shutil
 
+def get_uid_gid(user_str):
+    """Получает UID и GID пользователя по имени"""
+    try:
+        pw_record = pwd.getpwnam(user_str)
+        return pw_record.pw_uid, pw_record.pw_gid
+    except KeyError:
+        print(f"[ERROR] Пользователь '{user_str}' не найден в системе.")
+        return None, None
+
+def apply_permissions(path, uid, gid):
+    """Рекурсивно назначает права пользователю на путь"""
+    try:
+        os.chown(path, uid, gid)
+        for root, dirs, files in os.walk(path):
+            for d in dirs:
+                os.chown(os.path.join(root, d), uid, gid)
+            for f in files:
+                os.chown(os.path.join(root, f), uid, gid)
+    except PermissionError:
+        print(f"[WARNING] Не удалось сменить владельца {path}. Попробуйте запустить скрипт с sudo.")
+    except Exception as e:
+        print(f"[ERROR] Ошибка назначения прав на {path}: {e}")
 
 def unquote_value(value):
     """Удаляет кавычки из значения, если они есть"""
@@ -398,7 +423,7 @@ def clean_database(settings):
 
 
 def clean_folders(folders_to_clean, settings):
-    """Очистка папок через временное сохранение исключений"""
+    """Очистка содержимого папок с сохранением исключений и назначением прав"""
     if not folders_to_clean:
         print("Нет папок для очистки")
         return
@@ -406,13 +431,22 @@ def clean_folders(folders_to_clean, settings):
     preserve_dirs = [os.path.normpath(p) for p in settings['folders'].get('preserve_dirs', [])]
     preserve_files = [os.path.normpath(p) for p in settings['folders'].get('preserve_files', [])]
 
-    # Определяем корень сайта так же, как в load_settings (для корректных относительных путей)
+    # Определяем корень сайта относительно первой очищаемой папки
     raw_clean_paths = settings['folders']['clean']
     site_root = os.path.abspath(raw_clean_paths[0]) if raw_clean_paths else os.getcwd()
     while 'bitrix' not in os.listdir(site_root) and site_root != '/':
         site_root = os.path.dirname(site_root)
 
     tmp_dir = os.path.join(os.getcwd(), 'tmp')
+
+    copy_user = settings['folders'].get('copy_user')
+    uid, gid = None, None
+
+    if copy_user:
+        uid, gid = get_uid_gid(copy_user)
+        if not uid:
+            print("[ERROR] Работа прекращена из-за ошибки определения пользователя.")
+            return
 
     folder_descriptions = []
     for folder in folders_to_clean:
@@ -422,35 +456,27 @@ def clean_folders(folders_to_clean, settings):
 
     if settings['security']['confirm_destructive_operations']:
         if not confirm_destructive_operation(
-                f"ВНИМАНИЕ: Будет выполнена полная очистка и восстановление файлов.\nЦелевые папки:\n" + "\n".join(
+                f"ВНИМАНИЕ: Будет выполнена очистка СОДЕРЖИМОГО папок.\nЦелевые папки:\n" + "\n".join(
                     folder_descriptions)):
             print("Операция отменена пользователем")
             return
 
     try:
-        # Шаг 1: Создаем временные директории
-        os.makedirs(tmp_dir, exist_ok=True)
-
+        # Шаг 1: Сохранение исключений во временную папку
         preserved_tmp_base = os.path.join(tmp_dir, 'preserved_exceptions')
-        restored_tmp_base = os.path.join(tmp_dir, 'restored_sources')
-
-        # Очищаем старые данные в tmp, если они были
-        if os.path.exists(preserved_tmp_base):
-            rmtree(preserved_tmp_base)
-        if os.path.exists(restored_tmp_base):
-            rmtree(restored_tmp_base)
-
+        if os.path.exists(tmp_dir):
+            rmtree(tmp_dir)
         os.makedirs(preserved_tmp_base, exist_ok=True)
-        os.makedirs(restored_tmp_base, exist_ok=True)
 
-        # Шаг 2: Копируем исключения во временную папку ПЕРЕД очисткой
-        print("\n=== ЭТАП 1: Сохранение исключений во временную папку ===")
+        print("\n=== ЭТАП 1: Резервное копирование исключений ===")
         for root_folder in folders_to_clean:
             norm_root = os.path.normpath(root_folder)
+            if not os.path.exists(norm_root):
+                continue
+
             for current_dir, subdirs, files in os.walk(norm_root):
                 rel_path = os.path.relpath(current_dir, norm_root)
 
-                # Проверяем сами подпапки
                 save_current_dir = False
                 for preserve_rel in preserve_dirs:
                     full_preserve_abs = os.path.normpath(os.path.join(site_root, preserve_rel))
@@ -458,54 +484,82 @@ def clean_folders(folders_to_clean, settings):
                         save_current_dir = True
                         break
 
-                # Если саму папку нужно сохранить — копируем её целиком
                 if save_current_dir:
                     target_tmp = os.path.join(preserved_tmp_base, rel_path)
                     os.makedirs(target_tmp, exist_ok=True)
                     copytree(current_dir, target_tmp, dirs_exist_ok=True)
-                    print(f"Сохранена защищенная папка: {current_dir}")
 
-                # Проверяем файлы внутри текущей папки
                 for filename in files:
                     file_abs_path = os.path.join(current_dir, filename)
-                    should_save = False
-
-                    for preserve_rel in preserve_files:
-                        full_preserve_abs = os.path.normpath(os.path.join(site_root, preserve_rel))
-                        if file_abs_path == full_preserve_abs:
-                            should_save = True
-                            break
+                    should_save = any(file_abs_path == os.path.normpath(os.path.join(site_root, pf))
+                                      for pf in preserve_files)
 
                     if should_save:
                         target_tmp_file = os.path.join(preserved_tmp_base, rel_path, filename)
                         os.makedirs(os.path.dirname(target_tmp_file), exist_ok=True)
                         copy2(file_abs_path, target_tmp_file)
-                        print(f"Сохранен файл-исключение: {file_abs_path}")
 
-        # Шаг 3: Полная очистка целевых папок (rmtree без условий)
-        print("\n=== ЭТАП 2: Полная очистка целевых директорий ===")
+        # Шаг 2: Удаление ТОЛЬКО содержимого целевых папок
+        print("\n=== ЭТАП 2: Очистка содержимого целевых папок ===")
         for root_folder in folders_to_clean:
-            if os.path.exists(root_folder):
-                rmtree(root_folder)
-                print(f"Удалена вся папка: {root_folder}")
-            os.makedirs(root_folder, exist_ok=True)
-            print(f"Папка пересоздана: {root_folder}")
+            norm_root = os.path.normpath(root_folder)
 
-        # Шаг 4: Возвращаем исключения из временной папки назад
-        print("\n=== ЭТАП 3: Восстановление сохраненных исключений ===")
+            if not os.path.exists(norm_root):
+                os.makedirs(norm_root, exist_ok=True)
+                if uid is not None:
+                    apply_permissions(norm_root, uid, gid)
+                continue
+
+            # Получаем список того, что нужно удалить внутри папки
+            items_inside = os.listdir(norm_root)
+            for item in items_inside:
+                item_path = os.path.join(norm_root, item)
+
+                skip_item = False
+                # Проверяем защищенные подпапки
+                for preserve_rel in preserve_dirs:
+                    full_preserve_abs = os.path.normpath(os.path.join(site_root, preserve_rel))
+                    # Если это сама папка или она находится ВНУТРИ сохраняемой
+                    if item_path == full_preserve_abs or item_path.startswith(full_preserve_abs + os.sep):
+                        skip_item = True
+                        break
+
+                # Проверяем защищенные файлы
+                if not skip_item:
+                    for preserve_rel in preserve_files:
+                        full_preserve_abs = os.path.normpath(os.path.join(site_root, preserve_rel))
+                        if item_path == full_preserve_abs:
+                            skip_item = True
+                            break
+
+                if not skip_item:
+                    if os.path.isfile(item_path) or os.path.islink(item_path):
+                        os.unlink(item_path)
+                        print(f"Удален файл/ссылка: {item_path}")
+                    elif os.path.isdir(item_path):
+                        rmtree(item_path)
+                        print(f"Удалена папка: {item_path}")
+
+        # Шаг 3: Возвращаем исключения назад
+        print("\n=== ЭТАП 3: Восстановление исключений ===")
         if os.path.exists(preserved_tmp_base):
-            copytree(preserved_tmp_base, folders_to_clean[0], dirs_exist_ok=True)
-            print(f"Исключения возвращены в {folders_to_clean[0]}")
+            for root_folder in folders_to_clean:
+                copytree(preserved_tmp_base, root_folder, dirs_exist_ok=True)
+                print(f"Исключения возвращены в {root_folder}")
 
-        # Шаг 5: Копирование данных из секции copy_sources -> copy_destinations
-        print("\n=== ЭТАП 4: Копирование пользовательских данных (copy_sources) ===")
+        # Шаг 4: Назначение прав на ВСЕ созданные/очищенные папки
+        print("\n=== ЭТАП 4: Назначение прав доступа ===")
+        if uid is not None:
+            for root_folder in folders_to_clean:
+                apply_permissions(root_folder, uid, gid)
+
+        # Шаг 5: Копирование данных из секции copy_sources
+        print("\n=== ЭТАП 5: Копирование дополнительных файлов ===")
         copy_files_to_cleaned_folders(settings)
 
-        # Шаг 6: Очистка временных папок
-        print("\n=== ЭТАП 5: Очистка временных файлов скрипта ===")
+        # Шаг 6: Финальная чистка временных файлов
         if os.path.exists(tmp_dir):
             rmtree(tmp_dir)
-            print(f"Временная папка удалена: {tmp_dir}")
 
     except Exception as e:
         print(f"Критическая ошибка при обработке папок: {str(e)}")
