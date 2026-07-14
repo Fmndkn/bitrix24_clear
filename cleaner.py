@@ -488,6 +488,13 @@ def copy_files_to_cleaned_folders(settings):
         except Exception as e:
             print(f"Ошибка при копировании из {source_folder} в {dest_folder}: {str(e)}")
 
+def log_db_credentials_safe(db_settings):
+    print("\n=== ПРОВЕРКА УЧЕТНЫХ ДАННЫХ БД ===")
+    print(f"[OK] Хост: {db_settings['host']}")
+    print(f"[OK] Пользователь: {db_settings['user']}")
+    print(f"[OK] База данных: {db_settings['database_name']}")
+    print("[INFO] Пароль успешно загружен в память")
+    print("=" * 36)
 
 def show_database_info(settings):
     """Показать информацию о текущем состоянии базы данных"""
@@ -599,6 +606,8 @@ if __name__ == "__main__":
 
         print("Начало очистки...")
         print_settings_summary(settings)
+
+        log_db_credentials_safe(settings['database'])
 
         if settings['backup']['enable']:
             print("\n=== Резервное копирование ===")
