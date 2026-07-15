@@ -1,148 +1,26 @@
 #!/usr/bin/env python3
 
 import os
-import pymysql
 import shutil
 import configparser
 import subprocess
 import getpass
 import sys
 import re
+import json
 from datetime import datetime
 from shutil import rmtree, copytree, copy2
-import ast
 import tempfile
 import pwd
-import grp
-
-def get_uid_gid(user_str):
-    """Получает UID и GID пользователя по имени"""
-    try:
-        pw_record = pwd.getpwnam(user_str)
-        return pw_record.pw_uid, pw_record.pw_gid
-    except KeyError:
-        print(f"[ERROR] Пользователь '{user_str}' не найден в системе.")
-        return None, None
-
-def apply_permissions(path, uid, gid):
-    """Рекурсивно назначает права пользователю на путь"""
-    try:
-        os.chown(path, uid, gid)
-        for root, dirs, files in os.walk(path):
-            for d in dirs:
-                os.chown(os.path.join(root, d), uid, gid)
-            for f in files:
-                os.chown(os.path.join(root, f), uid, gid)
-    except PermissionError:
-        print(f"[WARNING] Не удалось сменить владельца {path}. Попробуйте запустить скрипт с sudo.")
-    except Exception as e:
-        print(f"[ERROR] Ошибка назначения прав на {path}: {e}")
-
-def unquote_value(value):
-    """Удаляет кавычки из значения, если они есть"""
-    if value is None:
-        return value
-    value_str = str(value).strip()
-    if (value_str.startswith('"') and value_str.endswith('"')) or \
-            (value_str.startswith("'") and value_str.endswith("'")):
-        return value_str[1:-1]
-    return value_str
-
-
-def parse_quoted_list(value):
-    """Парсит список значений, которые могут быть в кавычках"""
-    if not value:
-        return []
-
-    pattern = r'\"[^\"]+\"|\'[^\']+\'|[^,\s]+'
-    matches = re.findall(pattern, value)
-
-    result = []
-    for match in matches:
-        cleaned_value = unquote_value(match)
-        if cleaned_value:
-            result.append(cleaned_value)
-    return result
-
-
-# --- ИЗМЕНЕННАЯ ФУНКЦИЯ: теперь принимает путь к корню сайта ---
-def parse_bitrix_settings(site_root_path):
-    """Выполняет .settings.php через PHP-интерпретатор для получения чистых данных"""
-
-    php_file_path = os.path.join(site_root_path, 'bitrix', '.settings.php')
-
-    if not os.path.exists(php_file_path):
-        print(f"[DEBUG] Файл {php_file_path} не найден.")
-        return None
-
-    try:
-        # Проверяем наличие системного php
-        subprocess.run(['php', '-v'], capture_output=True, check=True)
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        print("[ERROR] На сервере не найден исполняемый файл 'php'. Невозможно прочитать настройки Bitrix.")
-        return None
-
-    php_code = f"""
-<?php
-$config = include('{php_file_path}');
-$connections = $config['connections']['value']['default'] ?? null;
-if ($connections) {{
-    echo json_encode([
-        'host' => $connections['host'],
-        'database' => $connections['database'],
-        'user' => $connections['login'],
-        'password' => $connections['password']
-    ]);
-}} else {{
-    echo "null";
-}}
-?>
-"""
-
-    try:
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.php', delete=False, encoding='utf-8') as tmp:
-            tmp.write(php_code)
-            tmp_path = tmp.name
-
-        result = subprocess.run(
-            ['php', tmp_path],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            cwd=site_root_path  # Важно: запускаем из папки сайта
-        )
-
-        os.unlink(tmp_path)
-
-        if result.returncode != 0:
-            print(f"[ERROR] Ошибка выполнения PHP-кода:\n{result.stderr.strip()}")
-            return None
-
-        output = result.stdout.strip()
-        if output == "null" or not output:
-            return None
-
-        import json
-        data = json.loads(output)
-
-        if all(data.values()):
-            return data
-        return None
-
-    except Exception as e:
-        print(f"[ERROR] Критическая ошибка при вызове PHP: {str(e)}")
-        return None
 
 
 def load_settings():
-    """Загрузка настроек из settings.ini или bitrix/.settings.php"""
 
     config = configparser.ConfigParser(interpolation=None)
 
     if not os.path.exists('settings.ini'):
         raise FileNotFoundError("Файл настроек settings.ini не найден")
 
-    # Читаем файл сразу, чтобы получить список папок 'clean' до парсинга БД
     config.read('settings.ini', encoding='utf-8')
 
     settings = {
@@ -155,17 +33,14 @@ def load_settings():
         'security': {'confirm_destructive_operations': True}
     }
 
-    # --- ОПРЕДЕЛЕНИЕ КОРНЯ САЙТА ---
     raw_clean_paths = config.get('folders', 'clean', fallback='')
     site_root = ""
 
     if raw_clean_paths.strip():
         first_clean_path = parse_quoted_list(raw_clean_paths)[0]
 
-        # Делаем путь абсолютным относительно места запуска скрипта
         abs_first_path = os.path.abspath(first_clean_path)
 
-        # Поднимаемся вверх по дереву каталогов, пока не найдем папку 'bitrix'
         current_check = abs_first_path
         while current_check != '/':
             potential_bitrix = os.path.join(current_check, 'bitrix')
@@ -178,7 +53,6 @@ def load_settings():
                 break
             current_check = parent
 
-        # Если битрикс так и не нашли (например, чистим /tmp), берем текущую директорию
         if not site_root:
             site_root = os.getcwd()
     else:
@@ -186,7 +60,6 @@ def load_settings():
 
     print(f"[INFO] Корень сайта определен как: {site_root}")
 
-    # --- ПАРСИНГ НАСТРОЕК БАЗЫ ДАННЫХ ---
     bx_db_config = parse_bitrix_settings(site_root)
 
     use_ini_fallback = False
@@ -211,10 +84,6 @@ def load_settings():
             'database_name': bx_db_config['database']
         })
 
-    # --- ЧТЕНИЕ ОСТАЛЬНЫХ ПАРАМЕТРОВ ИЗ SETTINGS.INI ---
-
-    # ВАЖНО: Здесь убрано жесткое присваивание mode = 'truncate'.
-    # Теперь режим берется строго из файла.
     raw_mode = config.get('database', 'mode', fallback='truncate').strip().lower()
     settings['database']['mode'] = raw_mode
 
@@ -258,14 +127,12 @@ def load_settings():
 
 
 def confirm_destructive_operation(operation_description):
-    """Запрос подтверждения для деструктивных операций"""
     print(f"\n⚠️  ВНИМАНИЕ: {operation_description}")
     response = input("Продолжить? (y/N): ").strip().lower()
     return response in ['y', 'yes', 'д', 'да']
 
 
 def run_as_user(command, username):
-    """Выполнить команду от имени указанного пользователя"""
     try:
         if username and username != getpass.getuser():
             command = ['sudo', '-u', username] + command
@@ -278,7 +145,6 @@ def run_as_user(command, username):
 
 
 def create_db_connection(db_settings):
-    """Создание подключения к базе данных с обработкой ошибок"""
     try:
         connection_params = {
             'host': db_settings['host'],
@@ -288,7 +154,6 @@ def create_db_connection(db_settings):
             'charset': 'utf8mb4'
         }
 
-        # Добавляем auth_plugin если указан
         if db_settings['auth_plugin']:
             connection_params['auth_plugin'] = db_settings['auth_plugin']
 
@@ -314,7 +179,6 @@ def create_db_connection(db_settings):
 
 
 def get_all_tables(connection):
-    """Получить список всех таблиц в базе данных"""
     with connection.cursor() as cursor:
         cursor.execute("SHOW TABLES;")
         tables = [row[0] for row in cursor.fetchall()]
@@ -322,7 +186,6 @@ def get_all_tables(connection):
 
 
 def drop_all_tables(connection):
-    """Удалить ВСЕ таблицы в базе данных"""
     try:
         with connection.cursor() as cursor:
             cursor.execute("SET FOREIGN_KEY_CHECKS = 0;")
@@ -347,7 +210,6 @@ def drop_all_tables(connection):
 
 
 def drop_specific_tables(connection, tables_list):
-    """Удалить указанные таблицы"""
     try:
         with connection.cursor() as cursor:
             cursor.execute("SET FOREIGN_KEY_CHECKS = 0;")
@@ -366,7 +228,6 @@ def drop_specific_tables(connection, tables_list):
 
 
 def truncate_tables(connection, tables_list):
-    """Очистить указанные таблицы"""
     try:
         with connection.cursor() as cursor:
             for table in tables_list:
@@ -380,7 +241,6 @@ def truncate_tables(connection, tables_list):
 
 
 def clean_database(settings):
-    """Основная функция для работы с базой данных"""
     db_settings = settings['database']
     connection, error = create_db_connection(db_settings)
     if error:
@@ -422,7 +282,6 @@ def clean_database(settings):
 
 
 def clean_folders(folders_to_clean, settings):
-    """Очистка содержимого папок с сохранением исключений и назначением прав"""
     if not folders_to_clean:
         print("Нет папок для очистки")
         return
@@ -430,7 +289,6 @@ def clean_folders(folders_to_clean, settings):
     preserve_dirs = [os.path.normpath(p) for p in settings['folders'].get('preserve_dirs', [])]
     preserve_files = [os.path.normpath(p) for p in settings['folders'].get('preserve_files', [])]
 
-    # Определяем корень сайта относительно первой очищаемой папки
     raw_clean_paths = settings['folders']['clean']
     site_root = os.path.abspath(raw_clean_paths[0]) if raw_clean_paths else os.getcwd()
     while 'bitrix' not in os.listdir(site_root) and site_root != '/':
@@ -461,7 +319,6 @@ def clean_folders(folders_to_clean, settings):
             return
 
     try:
-        # Шаг 1: Сохранение исключений во временную папку
         preserved_tmp_base = os.path.join(tmp_dir, 'preserved_exceptions')
         if os.path.exists(tmp_dir):
             rmtree(tmp_dir)
@@ -498,7 +355,6 @@ def clean_folders(folders_to_clean, settings):
                         os.makedirs(os.path.dirname(target_tmp_file), exist_ok=True)
                         copy2(file_abs_path, target_tmp_file)
 
-        # Шаг 2: Удаление ТОЛЬКО содержимого целевых папок
         print("\n=== ЭТАП 2: Очистка содержимого целевых папок ===")
         for root_folder in folders_to_clean:
             norm_root = os.path.normpath(root_folder)
@@ -509,13 +365,11 @@ def clean_folders(folders_to_clean, settings):
                     apply_permissions(norm_root, uid, gid)
                 continue
 
-            # Получаем список того, что нужно удалить внутри папки
             items_inside = os.listdir(norm_root)
             for item in items_inside:
                 item_path = os.path.join(norm_root, item)
 
                 skip_item = False
-                # Проверяем защищенные подпапки
                 for preserve_rel in preserve_dirs:
                     full_preserve_abs = os.path.normpath(os.path.join(site_root, preserve_rel))
                     # Если это сама папка или она находится ВНУТРИ сохраняемой
@@ -523,7 +377,6 @@ def clean_folders(folders_to_clean, settings):
                         skip_item = True
                         break
 
-                # Проверяем защищенные файлы
                 if not skip_item:
                     for preserve_rel in preserve_files:
                         full_preserve_abs = os.path.normpath(os.path.join(site_root, preserve_rel))
@@ -539,24 +392,20 @@ def clean_folders(folders_to_clean, settings):
                         rmtree(item_path)
                         print(f"Удалена папка: {item_path}")
 
-        # Шаг 3: Возвращаем исключения назад
         print("\n=== ЭТАП 3: Восстановление исключений ===")
         if os.path.exists(preserved_tmp_base):
             for root_folder in folders_to_clean:
                 copytree(preserved_tmp_base, root_folder, dirs_exist_ok=True)
                 print(f"Исключения возвращены в {root_folder}")
 
-        # Шаг 4: Назначение прав на ВСЕ созданные/очищенные папки
         print("\n=== ЭТАП 4: Назначение прав доступа ===")
         if uid is not None:
             for root_folder in folders_to_clean:
                 apply_permissions(root_folder, uid, gid)
 
-        # Шаг 5: Копирование данных из секции copy_sources
         print("\n=== ЭТАП 5: Копирование дополнительных файлов ===")
         copy_files_to_cleaned_folders(settings)
 
-        # Шаг 6: Финальная чистка временных файлов
         if os.path.exists(tmp_dir):
             rmtree(tmp_dir)
 
@@ -564,7 +413,6 @@ def clean_folders(folders_to_clean, settings):
         print(f"Критическая ошибка при обработке папок: {str(e)}")
 
 def copy_files_to_cleaned_folders(settings):
-    """Копирование файлов и папок в очищенные директории"""
     folders_settings = settings['folders']
     copy_sources = folders_settings['copy_sources']
     copy_destinations = folders_settings['copy_destinations']
@@ -643,7 +491,6 @@ def log_db_credentials_safe(db_settings):
     print("=" * 36)
 
 def show_database_info(settings):
-    """Показать информацию о текущем состоянии базы данных"""
     db_settings = settings['database']
     connection, error = create_db_connection(db_settings)
     if error:
@@ -666,7 +513,6 @@ def show_database_info(settings):
 
 
 def create_backup(settings, source_folders):
-    """Создание резервной копии файлов перед очисткой"""
     if not settings['backup']['enable']:
         print("Резервное копирование отключено в настройках")
         return None
@@ -701,7 +547,6 @@ def create_backup(settings, source_folders):
 
 
 def print_settings_summary(settings):
-    """Вывод сводки настроек"""
     print("=== ЗАГРУЖЕННЫЕ НАСТРОЙКИ ===")
     print(f"База данных: {settings['database']['database_name']}")
     print(f"Режим БД: {settings['database']['mode']}")
@@ -731,7 +576,6 @@ def print_settings_summary(settings):
 
 
 def check_dependencies():
-    """Проверка необходимых зависимостей"""
     try:
         import pymysql
         import cryptography
@@ -770,7 +614,6 @@ if __name__ == "__main__":
 
         print(f"\n=== Работа с базой данных (режим: {db_settings.get('mode', 'не указан')}) ===")
 
-        # Явно выводим параметры для проверки глазами
         print(f"[DEBUG] Target DB Name: '{db_settings.get('database_name')}'")
         print(f"[DEBUG] Mode selected: '{db_settings.get('mode')}'")
         print(f"[DEBUG] Tables list: {db_settings.get('tables')}")
@@ -778,7 +621,6 @@ if __name__ == "__main__":
         if not db_settings.get('database_name'):
             print("[ERROR] Имя базы данных ('database_name') пустое. Очистка БД пропущена.")
         else:
-            # Вызываем функцию очистки только если имя БД задано
             clean_database(settings)
 
         print("\n=== Состояние БД ПОСЛЕ очистки ===")
