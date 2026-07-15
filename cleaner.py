@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
 import os
-import pymysql
 import shutil
 import configparser
 import subprocess
@@ -13,125 +12,6 @@ from datetime import datetime
 from shutil import rmtree, copytree, copy2
 import tempfile
 import pwd
-import grp
-
-def get_uid_gid(user_str):
-    """Получает UID и GID пользователя по имени"""
-    try:
-        pw_record = pwd.getpwnam(user_str)
-        return pw_record.pw_uid, pw_record.pw_gid
-    except KeyError:
-        print(f"[ERROR] Пользователь '{user_str}' не найден в системе.")
-        return None, None
-
-def apply_permissions(path, uid, gid):
-    """Рекурсивно назначает права пользователю на путь"""
-    try:
-        os.chown(path, uid, gid)
-        for root, dirs, files in os.walk(path):
-            for d in dirs:
-                os.chown(os.path.join(root, d), uid, gid)
-            for f in files:
-                os.chown(os.path.join(root, f), uid, gid)
-    except PermissionError:
-        print(f"[WARNING] Не удалось сменить владельца {path}. Попробуйте запустить скрипт с sudo.")
-    except Exception as e:
-        print(f"[ERROR] Ошибка назначения прав на {path}: {e}")
-
-def unquote_value(value):
-    """Удаляет кавычки из значения, если они есть"""
-    if value is None:
-        return value
-    value_str = str(value).strip()
-    if (value_str.startswith('"') and value_str.endswith('"')) or \
-            (value_str.startswith("'") and value_str.endswith("'")):
-        return value_str[1:-1]
-    return value_str
-
-
-def parse_quoted_list(value):
-    """Парсит список значений, которые могут быть в кавычках"""
-    if not value:
-        return []
-
-    pattern = r'\"[^\"]+\"|\'[^\']+\'|[^,\s]+'
-    matches = re.findall(pattern, value)
-
-    result = []
-    for match in matches:
-        cleaned_value = unquote_value(match)
-        if cleaned_value:
-            result.append(cleaned_value)
-    return result
-
-
-# --- ИЗМЕНЕННАЯ ФУНКЦИЯ: теперь принимает путь к корню сайта ---
-def parse_bitrix_settings(site_root_path):
-    """Выполняет .settings.php через PHP-интерпретатор для получения чистых данных"""
-
-    php_file_path = os.path.join(site_root_path, 'bitrix', '.settings.php')
-
-    if not os.path.exists(php_file_path):
-        print(f"[DEBUG] Файл {php_file_path} не найден.")
-        return None
-
-    try:
-        # Проверяем наличие системного php
-        subprocess.run(['php', '-v'], capture_output=True, check=True)
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        print("[ERROR] На сервере не найден исполняемый файл 'php'. Невозможно прочитать настройки Bitrix.")
-        return None
-
-    php_code = f"""
-<?php
-$config = include('{php_file_path}');
-$connections = $config['connections']['value']['default'] ?? null;
-if ($connections) {{
-    echo json_encode([
-        'host' => $connections['host'],
-        'database' => $connections['database'],
-        'user' => $connections['login'],
-        'password' => $connections['password']
-    ]);
-}} else {{
-    echo "null";
-}}
-?>
-"""
-
-    try:
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.php', delete=False, encoding='utf-8') as tmp:
-            tmp.write(php_code)
-            tmp_path = tmp.name
-
-        result = subprocess.run(
-            ['php', tmp_path],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            cwd=site_root_path  # Важно: запускаем из папки сайта
-        )
-
-        os.unlink(tmp_path)
-
-        if result.returncode != 0:
-            print(f"[ERROR] Ошибка выполнения PHP-кода:\n{result.stderr.strip()}")
-            return None
-
-        output = result.stdout.strip()
-        if output == "null" or not output:
-            return None
-
-        import json
-        data = json.loads(output)
-
-        if all(data.values()):
-            return data
-        return None
-
-    except Exception as e:
-        print(f"[ERROR] Критическая ошибка при вызове PHP: {str(e)}")
-        return None
 
 
 def load_settings():
